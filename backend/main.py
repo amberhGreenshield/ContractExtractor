@@ -145,7 +145,7 @@ async def extract_contract_info(text: str) -> dict:
         return {"vendor_name": None, "contract_value": None, "contract_value_numeric": None, "currency": None, "notes": "Empty document"}
 
     truncated = text[:12000]
-    url = f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=2024-02-01"
+    url = f"{AZURE_OPENAI_ENDPOINT.rstrip('/')}/openai/deployments/{AZURE_OPENAI_DEPLOYMENT}/chat/completions?api-version=2024-08-01-preview"
     payload = {
         "messages": [
             {"role": "system", "content": "You extract structured information from contracts. Always respond with valid JSON only."},

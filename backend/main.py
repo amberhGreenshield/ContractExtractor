@@ -42,14 +42,20 @@ def list_blobs() -> list[dict]:
     container = client.get_container_client(BLOB_CONTAINER)
     files = []
     for blob in container.list_blobs():
-        name = blob.name.lower()
-        if name.endswith(".pdf") or name.endswith(".docx") or name.endswith(".txt"):
+        name_lower = blob.name.lower()
+        if name_lower.endswith(".pdf") or name_lower.endswith(".docx") or name_lower.endswith(".txt"):
+            parts = blob.name.split("/")
+            file_name = parts[-1]
+            folder = "/".join(parts[:-1]) if len(parts) > 1 else "root"
             files.append({
-                "id": blob.name,          # use blob name as ID
-                "name": blob.name.split("/")[-1],
+                "id": blob.name,        # full blob path used as ID
+                "name": file_name,
+                "folder": folder,
                 "path": blob.name,
                 "size": blob.size,
             })
+    # Sort by folder then filename so nested structure is obvious
+    files.sort(key=lambda f: (f["folder"], f["name"]))
     return files
 
 def download_blob_text(blob_name: str) -> str:
@@ -85,19 +91,46 @@ def download_blob_text(blob_name: str) -> str:
 
 # ─── Azure OpenAI extraction ──────────────────────────────────────────────────
 
-EXTRACTION_PROMPT = """You are a contract analysis assistant. Extract the following information from the contract text provided.
+EXTRACTION_PROMPT = """You are a contract analysis assistant. Your job is to extract four specific fields from a contract, regardless of its format or structure.
 
-Return ONLY a valid JSON object with these exact keys:
+Contracts come in many formats — some have formal BETWEEN/AND blocks, some summarize parties in a preamble sentence like "Raj Rajbir of 2495577 ONTARIO INC.", some list parties in a table, and amendments may reference an original agreement. Read the entire document and use context clues.
+
+FIELDS TO EXTRACT:
+
+1. "supplier_name": The incorporated company or legal entity that is PROVIDING the services.
+   - This is the Consultant / Supplier / Vendor / Contractor entity — the one being paid.
+   - It is usually a numbered company (e.g. "2495577 ONTARIO INC.") or a named company.
+   - It is NOT the client or buyer (the company paying for services, e.g. GreenShield, a bank, a hospital).
+   - It may appear as: "Raj Rajbir of 2495577 ONTARIO INC." → supplier is "2495577 ONTARIO INC."
+   - In amendments, it may refer back to the original agreement — still extract the supplier entity.
+
+2. "contractor_name": The individual PERSON who is doing the work or who signed as the supplier representative.
+   - Check the signature block first — look for the name signed on the supplier/consultant side.
+   - Also check preamble sentences like "Raj Rajbir of 2495577 ONTARIO INC." → person is "Raj Rajbir".
+   - This is always a human name, not a company name.
+   - If the same person appears in both the preamble and the signature, that confirms it.
+
+3. "hourly_rate": The per-hour fee charged by the consultant.
+   - Search anywhere in the document: Compensation, Fees, Rate, Payment, Schedule sections.
+   - Look for patterns like "$X per hour", "$X/hr", "hourly rate of $X".
+   - If the rate is monthly or fixed (not hourly), return that value and note it in "notes".
+   - Return as a clean string e.g. "$60/hr" or "$5,000/month".
+
+4. "position_title": The job title or role the consultant is performing.
+   - Look in Services, Scope of Work, Provision of Services, or Recitals sections.
+   - It is often in quotes or bold e.g. "Senior Project Coordinator", "Business Analyst".
+   - In amendments, it may replace a previous title — use the most recent one.
+
+Return ONLY a valid JSON object with exactly these keys. No markdown, no explanation, nothing outside the JSON:
 {
-  "vendor_name": "the name of the vendor/supplier/contractor",
-  "contract_value": "the total contract value or cost as a string (include currency symbol)",
-  "contract_value_numeric": 0.0,
-  "currency": "USD/CAD/EUR/etc",
-  "notes": "any important caveats (e.g. recurring, per-year, not found)"
+  "supplier_name": "...",
+  "contractor_name": "...",
+  "hourly_rate": "...",
+  "position_title": "...",
+  "notes": "note anything ambiguous, missing, or assumed here"
 }
 
-If a field cannot be found, use null. For contract_value_numeric, extract the numeric value only (no symbols).
-Do not include any explanation outside the JSON.
+If a field genuinely cannot be found after reading the whole document, use null.
 
 Contract text:
 """
@@ -143,6 +176,22 @@ async def extract_contract_info(text: str) -> dict:
 async def health():
     return {"status": "ok"}
 
+class TestRequest(BaseModel):
+    text: str
+
+@app.post("/contracts/test")
+async def test_extraction(req: TestRequest):
+    """Paste raw contract text and see what GPT-4 extracts. No blob storage needed."""
+    try:
+        result = await extract_contract_info(req.text)
+        return {
+            "extracted": result,
+            "chars_processed": len(req.text),
+            "truncated": len(req.text) > 12000,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/contracts/list")
 async def list_contracts():
     try:
@@ -161,16 +210,20 @@ async def extract_contracts(req: ExtractRequest):
         try:
             text = download_blob_text(blob_name)
             extracted = await extract_contract_info(text)
+            # derive a clean folder name from the blob path
+            parts = blob_name.split("/")
+            folder = "/".join(parts[:-1]) if len(parts) > 1 else "root"
             results.append({
                 "file_id": blob_name,
-                "file_name": blob_name.split("/")[-1],
-                "path": blob_name,
+                "file_name": parts[-1],
+                "folder": folder,
                 **extracted,
             })
         except Exception as e:
             results.append({
                 "file_id": blob_name,
                 "file_name": blob_name.split("/")[-1],
+                "folder": "",
                 "error": str(e),
             })
     return {"results": results}
@@ -206,8 +259,8 @@ async def export_excel(req: ExtractRequest):
     ws["A2"].alignment = Alignment(horizontal="center")
     ws.row_dimensions[2].height = 18
 
-    headers    = ["#", "File Name", "Vendor Name", "Contract Value", "Currency", "Notes", "Blob Path"]
-    col_widths = [5, 35, 30, 18, 10, 35, 40]
+    headers    = ["#", "File Name", "Folder", "Supplier (Company)", "Contractor (Person)", "Hourly Rate", "Position Title", "Notes"]
+    col_widths = [5, 30, 25, 28, 22, 14, 28, 35]
 
     for col, (h, w) in enumerate(zip(headers, col_widths), 1):
         cell = ws.cell(row=4, column=col, value=h)
@@ -226,11 +279,12 @@ async def export_excel(req: ExtractRequest):
         row_data = [
             i,
             row.get("file_name", ""),
-            row.get("vendor_name") or ("ERROR" if has_error else "Not found"),
-            row.get("contract_value") or ("—" if not has_error else row.get("error", "Error")),
-            row.get("currency") or "—",
+            row.get("folder", ""),
+            row.get("supplier_name") or ("ERROR" if has_error else "Not found"),
+            row.get("contractor_name") or ("—" if not has_error else row.get("error", "")),
+            row.get("hourly_rate") or "—",
+            row.get("position_title") or "—",
             row.get("notes") or "—",
-            row.get("path", ""),
         ]
 
         for col, value in enumerate(row_data, 1):

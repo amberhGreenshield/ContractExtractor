@@ -60,10 +60,12 @@ def list_blobs() -> list[dict]:
 
 def download_blob_text(blob_name: str) -> str:
     client = get_blob_client()
+    # strip any accidental whitespace from the path
+    blob_name = blob_name.strip()
     blob = client.get_blob_client(container=BLOB_CONTAINER, blob=blob_name)
     content = blob.download_blob().readall()
 
-    name_lower = blob_name.lower()
+    name_lower = blob_name.lower().strip()
 
     if name_lower.endswith(".txt"):
         return content.decode("utf-8", errors="ignore")
